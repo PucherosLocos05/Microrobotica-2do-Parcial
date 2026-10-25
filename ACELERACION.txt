@@ -1,15 +1,74 @@
 // --- Definición de Pines ---
-const int ENA = 25;       // Pin PWM para el L298N
-const int IN1 = 26;       // Dirección 1
-const int IN2 = 27;       // Dirección 2
+const int ENA = 25;         // Pin PWM para el L298N
+const int IN1 = 26;         // Dirección 1
+const int IN2 = 27;         // Dirección 2
 const int encoderPinA = 32; // Encoder (Canal A)
 
-// --- Selector de Perfil (1 al 9 según la guía de tu profesor) ---
-int tipoPerfil = 8; // Cambia este número del 1 al 9 para probar cada función
+// --- Selector de Perfil (1 al 9) ---
+// También puedes cambiarlo en vivo escribiendo un número del 1 al 9 en el Monitor Serial
+int tipoPerfil = 2;
+
+// Si es mayor a 0, se usa este valor (pulsos/s a PWM 255) y se omite la calibración.
+// Después de una calibración exitosa, anota aquí el número que imprime.
+const float VEL_MAX_MANUAL = 0;
 
 volatile long encoderCount = 0;
+
+// --- Variables de medición ---
+float velMaxPPS = 1000;         // Velocidad máxima en pulsos/s
+long lastPulses = 0;
+unsigned long lastSpeedTime = 0;
+float velocidadPPS = 0;         // Velocidad real en pulsos/s
+unsigned long tInicio = 0;      // Instante en que arranca el perfil
+
 void IRAM_ATTR countEncoder() {
   encoderCount++;
+}
+
+// Calibración: motor a PWM 255 para medir la velocidad máxima
+void calibrarVelocidadMaxima() {
+  Serial.println("Calibrando velocidad maxima...");
+  analogWrite(ENA, 255);
+  delay(1500);                         // Esperar a que el motor arranque y se estabilice
+
+  noInterrupts();
+  long inicio = encoderCount;
+  interrupts();
+  unsigned long t0 = millis();
+  delay(1000);                         // Medir durante 1 segundo
+  noInterrupts();
+  long fin = encoderCount;
+  interrupts();
+
+  float medida = (fin - inicio) * 1000.0 / (millis() - t0);
+
+  analogWrite(ENA, 0);
+  delay(1000);                         // Dejar que el motor se detenga
+
+  if (medida < 10) {
+    Serial.println("ERROR: calibracion fallida (casi 0 pulsos). Revisa alimentacion del motor y el encoder.");
+    Serial.println("Usando valor provisional de 1000 pulsos/s.");
+    velMaxPPS = 1000;
+  } else {
+    velMaxPPS = medida;
+    Serial.print("Velocidad maxima: ");
+    Serial.print(velMaxPPS);
+    Serial.println(" pulsos/s");
+  }
+}
+
+// Permite cambiar de perfil escribiendo 1-9 en el Monitor Serial
+void leerSerial() {
+  if (Serial.available() > 0) {
+    int n = Serial.parseInt();
+    while (Serial.available()) Serial.read();   // Limpiar el buffer
+    if (n >= 1 && n <= 9) {
+      tipoPerfil = n;
+      tInicio = millis();                       // Reiniciar el tiempo del perfil
+      Serial.print(">> Perfil cambiado a ");
+      Serial.println(tipoPerfil);
+    }
+  }
 }
 
 void setup() {
@@ -17,25 +76,44 @@ void setup() {
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
   pinMode(encoderPinA, INPUT_PULLUP);
-  
+
   attachInterrupt(digitalPinToInterrupt(encoderPinA), countEncoder, RISING);
   Serial.begin(115200);
+  delay(500);
 
   // Dirección fija de giro hacia adelante
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
+
+  if (VEL_MAX_MANUAL > 0) {
+    velMaxPPS = VEL_MAX_MANUAL;
+    Serial.print("Usando velocidad maxima manual: ");
+    Serial.print(velMaxPPS);
+    Serial.println(" pulsos/s");
+  } else {
+    calibrarVelocidadMaxima();
+  }
+
+  // Iniciar mediciones y perfil desde cero
+  noInterrupts();
+  lastPulses = encoderCount;
+  interrupts();
+  lastSpeedTime = millis();
+  tInicio = millis();
 }
 
 void loop() {
-  // Tiempo en segundos desde el inicio
-  float t = millis() / 1000.0; 
+  leerSerial();
+
+  // Tiempo en segundos desde que arrancó el perfil
+  float t = (millis() - tInicio) / 1000.0;
   float pwmOutput = 0;
 
   switch (tipoPerfil) {
-    
+
     // 1. Constante: p(t) = p0
     case 1: {
-      float p0 = 120; // Velocidad fija
+      float p0 = 120;
       pwmOutput = p0;
       break;
     }
@@ -43,41 +121,38 @@ void loop() {
     // 2. Rampa lineal: p(t) = p0 + at
     case 2: {
       float p0 = 0;
-      float a = 20; // aceleración (pasos/s^2 o tasa de incremento)
-      pwmOutput = p0 + (a * fmod(t, 15.0)); // Se reinicia cada 15s
+      float a = 20;
+      pwmOutput = p0 + (a * fmod(t, 15.0));
       break;
     }
 
-    // 3. Perfil trapezoidal: Aceleración, constante y desaceleración
+    // 3. Trapezoidal
     case 3: {
-      float ciclo = fmod(t, 12.0); // Ciclo de 12 segundos
-      if (ciclo < 3.0) pwmOutput = ciclo * 80;          // Aceleración
-      else if (ciclo < 9.0) pwmOutput = 240;            // Constante
-      else pwmOutput = 240 - ((ciclo - 9.0) * 80);      // Desaceleración
+      float ciclo = fmod(t, 12.0);
+      if (ciclo < 3.0) pwmOutput = ciclo * 80;
+      else if (ciclo < 9.0) pwmOutput = 240;
+      else pwmOutput = 240 - ((ciclo - 9.0) * 80);
       break;
     }
 
-    // 4. Senoidal: p(t) = p0 + A * sin(2*pi*fm*t + phi)
+    // 4. Senoidal
     case 4: {
       float p0 = 125;
       float A = 100;
-      float fm = 0.2; // Frecuencia de modulación (Hz)
+      float fm = 0.2;
       pwmOutput = p0 + A * sin(2 * 3.14159 * fm * t);
       break;
     }
 
-    // 5. Escalonada (Onda cuadrada): Alterna entre p1 y p2
+    // 5. Escalonada (onda cuadrada)
     case 5: {
-      float T = 6.0; // Periodo de 6 segundos
-      if (fmod(t, T) < (T / 2.0)) {
-        pwmOutput = 60;  // p1
-      } else {
-        pwmOutput = 220; // p2
-      }
+      float T = 6.0;
+      if (fmod(t, T) < (T / 2.0)) pwmOutput = 60;
+      else pwmOutput = 220;
       break;
     }
 
-    // 6. Exponencial creciente: p(t) = p0 * (1 + alpha * t)^k
+    // 6. Exponencial creciente
     case 6: {
       float p0 = 20;
       float alpha = 0.5;
@@ -87,51 +162,64 @@ void loop() {
       break;
     }
 
-    // 7. Perfil Gaussiano: Pulso de velocidad localizado
+    // 7. Gaussiano
     case 7: {
       float A = 250;
-      float t0 = 5.0;  // Centro del pulso en segundos
-      float sigma = 1.5; // Ancho del pulso
+      float t0 = 5.0;
+      float sigma = 1.5;
       float t_mod = fmod(t, 10.0);
       pwmOutput = A * exp(-pow((t_mod - t0) / sigma, 2));
       break;
     }
 
-    // 8. Diente de sierra: p(t) = A * (t/T mod 1)
+    // 8. Diente de sierra
     case 8: {
       float A = 255;
-      float T = 5.0; // Periodo de 5 segundos
+      float T = 5.0;
       pwmOutput = A * fmod(t / T, 1.0);
       break;
     }
 
-    // 9. Modulación por ruido blanco: p(t) = p0 + epsilon(t)
+    // 9. Ruido blanco (sin delay bloqueante: el ruido se renueva cada 100 ms)
     case 9: {
+      static unsigned long lastNoise = 0;
+      static float epsilon = 0;
+      if (millis() - lastNoise >= 100) {
+        lastNoise = millis();
+        epsilon = random(-50, 50);
+      }
       float p0 = 128;
-      float A = 50; // Amplitud del ruido aleatorio
-      float epsilon = random(-A, A);
       pwmOutput = p0 + epsilon;
-      delay(100); // Pausa para que el ruido no sature la ejecución
       break;
     }
   }
 
-  // Asegurar que el valor PWM esté siempre entre 0 y 255
+  // Limitar PWM y aplicarlo
   pwmOutput = constrain(pwmOutput, 0, 255);
   analogWrite(ENA, (int)pwmOutput);
 
-  // Lectura del encoder
+  // --- Velocidad real: pulsos por segundo, calculada cada 100 ms ---
   noInterrupts();
   long currentPulses = encoderCount;
   interrupts();
 
-  // Impresión en formato compatible con el Serial Plotter (Herramientas > Plotter Serial)
-  Serial.print("Perfil:");
-  Serial.print(tipoPerfil);
-  Serial.print(",PWM:");
-  Serial.print(pwmOutput);
-  Serial.print(",Pulsos:");
-  Serial.println(currentPulses);
+  unsigned long ahora = millis();
+  if (ahora - lastSpeedTime >= 100) {
+    velocidadPPS = (currentPulses - lastPulses) * 1000.0 / (ahora - lastSpeedTime);
+    lastPulses = currentPulses;
+    lastSpeedTime = ahora;
+  }
+
+  // --- Ambas curvas en % de la velocidad maxima ---
+  float ideal = (pwmOutput / 255.0) * 100.0;
+  float real  = (velocidadPPS / velMaxPPS) * 100.0;
+
+  // Formato para Herramientas > Plotter Serie
+   Serial.print("Min:0,Max:100,");   // Líneas fijas que obligan a la escala 0-100
+  Serial.print("Ideal:");
+  Serial.print(ideal);
+  Serial.print(",Real:");
+  Serial.println(real);
 
   delay(20);
 }
