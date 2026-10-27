@@ -1,21 +1,30 @@
 // =====================================================
 //  CONTROL DE MOTOR: POSICION + VELOCIDAD + ACELERACION
-//  ESP32 + L298N + Encoder en cuadratura
+//  ESP32 + L298N + Encoder en cuadratura + ACS712
 // =====================================================
 
 // --- Definición de Pines ---
-const int ENA = 25;         // Pin PWM (L298N)
-const int IN1 = 26;         // Dirección 1 (L298N)
-const int IN2 = 27;         // Dirección 2 (L298N)
-const int potPin = 34;      // Pin analógico del potenciómetro
+const int ENA = 25;          // Pin PWM (L298N)
+const int IN1 = 26;          // Dirección 1 (L298N)
+const int IN2 = 27;          // Dirección 2 (L298N)
+const int potPin = 34;       // Pin analógico del potenciómetro
+const int pinCorriente = 35; // Salida del ACS712 (a través del divisor de voltaje)
 
 // --- Pines del Encoder ---
-const int encoderPinA = 32; // Canal A (con interrupción)
-const int encoderPinB = 33; // Canal B (dirección)
+const int encoderPinA = 32;  // Canal A (con interrupción)
+const int encoderPinB = 33;  // Canal B (dirección)
 
 // --- Configuración del encoder ---
 // Pulsos que cuenta el código por UNA vuelta completa del eje
 const long PULSOS_POR_VUELTA = 370;
+
+// --- Configuración del sensor ACS712 ---
+// Sensibilidad según tu modelo: 5A = 185 mV/A, 20A = 100 mV/A, 30A = 66 mV/A
+const float SENSIBILIDAD_MV_A = 185.0;
+// Divisor de voltaje 10k + 20k: Vsensor = Vpin * 1.5
+// Si no usas divisor, pon 1.0 (NO recomendado: el ACS712 saca hasta 5V)
+const float FACTOR_DIVISOR = 1.5;
+float offsetMV = 2500;       // Voltaje del sensor con 0 A (se calibra al inicio)
 
 volatile long encoderCount = 0;
 
@@ -122,6 +131,36 @@ void actualizarVelocidad() {
   }
 }
 
+// -----------------------------------------------------
+//  Sensor de corriente ACS712
+// -----------------------------------------------------
+// Lee el voltaje del sensor (en mV) promediando varias muestras.
+// El promedio es necesario porque la corriente del motor con PWM oscila.
+float leerMilivoltsSensor(int muestras) {
+  float suma = 0;
+  for (int i = 0; i < muestras; i++) {
+    suma += analogReadMilliVolts(pinCorriente);
+    delayMicroseconds(50);
+  }
+  return (suma / muestras) * FACTOR_DIVISOR;
+}
+
+// Corriente del motor en amperes
+float leerCorriente() {
+  return (leerMilivoltsSensor(200) - offsetMV) / SENSIBILIDAD_MV_A;
+}
+
+// Calibra el punto de 0 A. El motor se detiene durante la calibración.
+void calibrarOffsetCorriente() {
+  Serial.println("Calibrando sensor de corriente (motor detenido)...");
+  detenerMotor();
+  delay(500);
+  offsetMV = leerMilivoltsSensor(1000);
+  Serial.print("Offset ACS712: ");
+  Serial.print(offsetMV);
+  Serial.println(" mV (deberia estar cerca de 2500)");
+}
+
 // Calibración: motor a PWM 255 para medir la velocidad máxima
 void calibrarVelocidadMaxima() {
   Serial.println("Calibrando velocidad maxima...");
@@ -162,6 +201,7 @@ void mostrarAyuda() {
   Serial.println("POT        Velocidad con potenciometro");
   Serial.println("A<perfil>  Curva de aceleracion 1-9. Ej: A4");
   Serial.println("Z          Fijar cero (0 grados) en la posicion actual");
+  Serial.println("C          Recalibrar sensor de corriente (detiene el motor)");
   Serial.println("S          Detener motor");
   Serial.println("H          Mostrar esta ayuda");
   Serial.println("================================");
@@ -185,6 +225,14 @@ void procesarComando(String entrada) {
   // Ayuda
   if (entrada == "H" || entrada == "?") {
     mostrarAyuda();
+    return;
+  }
+
+  // Recalibrar sensor de corriente
+  if (entrada == "C") {
+    cambiarModo(MODO_STOP);
+    calibrarOffsetCorriente();
+    Serial.println(">> Motor DETENIDO. Escribe un comando para continuar.");
     return;
   }
 
@@ -308,6 +356,9 @@ void loopPosicion() {
 
   analogWrite(ENA, pwmValue);
 
+  // Corriente del motor
+  float corriente = leerCorriente();
+
   // Monitoreo
   float anguloActual = (currentPosition * 360.0) / PULSOS_POR_VUELTA;
   Serial.print("Objetivo: ");
@@ -317,7 +368,10 @@ void loopPosicion() {
   Serial.print(" deg | Error: ");
   Serial.print(error);
   Serial.print(" pulsos | PWM: ");
-  Serial.println(pwmValue);
+  Serial.print(pwmValue);
+  Serial.print(" | Corriente: ");
+  Serial.print(corriente, 3);
+  Serial.println(" A");
 }
 
 // -----------------------------------------------------
@@ -344,6 +398,9 @@ void loopVelocidad() {
     long currentPulses = encoderCount;
     interrupts();
 
+    // Corriente del motor, medida solo al imprimir
+    float corriente = leerCorriente();
+
     Serial.print("Modo: ");
     Serial.print(modo == MODO_VEL_MANUAL ? "MANUAL" : "POT");
     Serial.print(" | Pot: ");
@@ -351,7 +408,10 @@ void loopVelocidad() {
     Serial.print(" | PWM: ");
     Serial.print(pwmValue);
     Serial.print(" | Pulsos Encoder: ");
-    Serial.println(currentPulses);
+    Serial.print(currentPulses);
+    Serial.print(" | Corriente: ");
+    Serial.print(corriente, 3);
+    Serial.println(" A");
   }
 }
 
@@ -452,16 +512,21 @@ void loopAceleracion() {
   pwmOutput = constrain(pwmOutput, 0, 255);
   analogWrite(ENA, (int)pwmOutput);
 
+  // Corriente del motor
+  float corriente = leerCorriente();
+
   // Ambas curvas en % de la velocidad máxima
   float ideal = (pwmOutput / 255.0) * 100.0;
   float real  = (velocidadPPS / velMaxPPS) * 100.0;
 
-  // Formato para Herramientas > Plotter Serie
+  // Impresión (Monitor Serial y Plotter Serie)
   Serial.print("Min:0,Max:100,");   // Líneas fijas que obligan a la escala 0-100
   Serial.print("Ideal:");
   Serial.print(ideal);
   Serial.print(",Real:");
-  Serial.println(real);
+  Serial.print(real);
+  Serial.print(",Corriente_A:");
+  Serial.println(corriente, 3);
 }
 
 // -----------------------------------------------------
@@ -472,6 +537,7 @@ void setup() {
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
   pinMode(potPin, INPUT);
+  pinMode(pinCorriente, INPUT);
 
   pinMode(encoderPinA, INPUT_PULLUP);
   pinMode(encoderPinB, INPUT_PULLUP);
@@ -481,6 +547,7 @@ void setup() {
   delay(500);
 
   detenerMotor();
+  calibrarOffsetCorriente();   // Con el motor apagado
   reiniciarMedicion();
 
   mostrarAyuda();

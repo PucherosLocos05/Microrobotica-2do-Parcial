@@ -1,7 +1,8 @@
 // --- Definición de Pines ---
-const int ENA = 25;       // Pin PWM (L298N)
-const int IN1 = 26;       // Dirección 1 (L298N)
-const int IN2 = 27;       // Dirección 2 (L298N)
+const int ENA = 25;         // Pin PWM (L298N)
+const int IN1 = 26;         // Dirección 1 (L298N)
+const int IN2 = 27;         // Dirección 2 (L298N)
+const int pinCorriente = 35; // Salida del ACS712 (a través del divisor de voltaje)
 
 // --- Pines del Encoder ---
 const int encoderPinA = 32; // Canal A (con interrupción)
@@ -9,8 +10,15 @@ const int encoderPinB = 33; // Canal B (dirección)
 
 // --- Configuración del encoder ---
 // Pulsos que cuenta el código por UNA vuelta completa del eje.
-// Ajusta este valor (ver nota abajo).
 const long PULSOS_POR_VUELTA = 370;
+
+// --- Configuración del sensor ACS712 ---
+// Sensibilidad según tu modelo: 5A = 185 mV/A, 20A = 100 mV/A, 30A = 66 mV/A
+const float SENSIBILIDAD_MV_A = 185.0;
+// Divisor de voltaje 10k + 20k: Vsensor = Vpin * 1.5
+// Si no usas divisor, pon 1.0 (NO recomendado: el ACS712 saca hasta 5V)
+const float FACTOR_DIVISOR = 1.5;
+float offsetMV = 2500;      // Voltaje del sensor con 0 A (se calibra al inicio)
 
 // --- Variables de Control ---
 volatile long encoderCount = 0;
@@ -26,6 +34,30 @@ void IRAM_ATTR countEncoder() {
   } else {
     encoderCount--;
   }
+}
+
+// Lee el voltaje del sensor (en mV) promediando varias muestras.
+// El promedio es necesario porque la corriente del motor con PWM oscila.
+float leerMilivoltsSensor(int muestras) {
+  float suma = 0;
+  for (int i = 0; i < muestras; i++) {
+    suma += analogReadMilliVolts(pinCorriente);
+    delayMicroseconds(50);
+  }
+  return (suma / muestras) * FACTOR_DIVISOR;
+}
+
+// Calibra el punto de 0 A. El motor debe estar detenido.
+void calibrarOffsetCorriente() {
+  Serial.println("Calibrando sensor de corriente (motor detenido)...");
+  analogWrite(ENA, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  delay(500);
+  offsetMV = leerMilivoltsSensor(1000);
+  Serial.print("Offset ACS712: ");
+  Serial.print(offsetMV);
+  Serial.println(" mV (deberia estar cerca de 2500)");
 }
 
 // Lee un ángulo desde el Monitor Serial
@@ -69,12 +101,18 @@ void setup() {
   pinMode(ENA, OUTPUT);
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
+  pinMode(pinCorriente, INPUT);
 
   pinMode(encoderPinA, INPUT_PULLUP);
   pinMode(encoderPinB, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(encoderPinA), countEncoder, RISING);
 
   Serial.begin(115200);
+  delay(500);
+
+  // Offset del sensor con el motor apagado
+  calibrarOffsetCorriente();
+
   Serial.println("Escribe un angulo (0-360) para mover el motor. Z = fijar cero aqui.");
 }
 
@@ -104,6 +142,9 @@ void loop() {
 
   analogWrite(ENA, pwmValue);
 
+  // Corriente del motor (A)
+  float corriente = (leerMilivoltsSensor(200) - offsetMV) / SENSIBILIDAD_MV_A;
+
   // Monitoreo
   float anguloActual = (currentPosition * 360.0) / PULSOS_POR_VUELTA;
   Serial.print("Objetivo: ");
@@ -113,7 +154,10 @@ void loop() {
   Serial.print(" deg | Error: ");
   Serial.print(error);
   Serial.print(" pulsos | PWM: ");
-  Serial.println(pwmValue);
+  Serial.print(pwmValue);
+  Serial.print(" | Corriente: ");
+  Serial.print(corriente, 3);
+  Serial.println(" A");
 
   delay(15);
 }
