@@ -1,0 +1,320 @@
+// --- Definición de Pines ---
+const int ENA = 25;          // Pin PWM (L298N)
+const int IN1 = 26;          // Dirección 1 (L298N)
+const int IN2 = 27;          // Dirección 2 (L298N)
+const int pinCorriente = 35; // Salida del ACS712 (a través del divisor de voltaje)
+const int pinIR = 14;        // Salida (OUT) del sensor infrarrojo
+
+// --- Pines del Encoder ---
+const int encoderPinA = 32;  // Canal A (con interrupción)
+const int encoderPinB = 33;  // Canal B (dirección)
+
+// --- Configuración del encoder ---
+const long PULSOS_POR_VUELTA = 370;
+
+// --- Configuración de la salida de datos ---
+const bool MODO_TELEPLOT = true;               // true = formato Teleplot, false = texto normal
+const unsigned long INTERVALO_TELEMETRIA = 30; // ms entre cada envío de datos
+unsigned long lastTelemetria = 0;
+
+// --- Configuración del sensor ACS712 ---
+// Sensibilidad según tu modelo: 5A = 185 mV/A, 20A = 100 mV/A, 30A = 66 mV/A
+const float SENSIBILIDAD_MV_A = 185.0;
+const float FACTOR_DIVISOR = 1.5;   // Divisor 10k + 20k
+float offsetMV = 2500;
+
+// --- Configuración del sensor infrarrojo ---
+const bool IR_ACTIVO_BAJO = true;   // El módulo da LOW cuando detecta la marca
+const int PWM_REFERENCIA = 75;      // Velocidad lenta para buscar la referencia
+const unsigned long TIEMPO_MAX_REF = 10000;  // Máximo 10 s buscando la marca
+
+// --- Parámetros del control PD (ajustables) ---
+float Kp = 3.0;             // Fuerza según la distancia al objetivo
+float Kd = 0.20;            // Amortiguación según la velocidad (sube si aún se pasa)
+const int PWM_MIN = 70;     // PWM mínimo para vencer la fricción del motor
+const int PWM_MAX = 255;
+const int zonaMuerta = 2;   // Margen de +/- pulsos para considerar "llegó"
+
+// --- Variables de Control ---
+volatile long encoderCount = 0;
+volatile bool irFlag = false;      // Se activa cuando el IR detecta la marca
+volatile long irCount = 0;         // Posición del encoder en el instante de la detección
+long targetPosition = 0;
+float anguloObjetivo = 0;
+
+// --- Velocidad estimada (pulsos/s) ---
+float velFiltrada = 0;
+long lastPosCtrl = 0;
+unsigned long lastCtrlTime = 0;
+
+void IRAM_ATTR countEncoder() {
+  if (digitalRead(encoderPinB) == HIGH) {
+    encoderCount++;
+  } else {
+    encoderCount--;
+  }
+}
+
+// Se ejecuta en el instante en que el sensor IR detecta la marca
+void IRAM_ATTR irDetectado() {
+  if (!irFlag) {          // Solo la primera detección (ignora rebotes)
+    irCount = encoderCount;
+    irFlag = true;
+  }
+}
+
+bool irDetecta() {
+  return digitalRead(pinIR) == (IR_ACTIVO_BAJO ? LOW : HIGH);
+}
+
+// Envía una variable en formato Teleplot:  >nombre:tiempo:valor
+void teleplot(const char* nombre, unsigned long ts, float valor) {
+  Serial.print('>');
+  Serial.print(nombre);
+  Serial.print(':');
+  Serial.print(ts);
+  Serial.print(':');
+  Serial.println(valor, 2);
+}
+
+// -----------------------------------------------------
+//  Control del motor
+// -----------------------------------------------------
+void detenerMotor() {            // Libre (sin freno)
+  analogWrite(ENA, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+}
+
+void frenarMotor() {             // Freno eléctrico: evita que siga de largo
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, 255);
+}
+
+void girarPositivo(int pwm) {    // Sentido en el que aumentan los pulsos
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, pwm);
+}
+
+void girarNegativo(int pwm) {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, pwm);
+}
+
+// -----------------------------------------------------
+//  Sensor de corriente ACS712
+// -----------------------------------------------------
+float leerMilivoltsSensor(int muestras) {
+  float suma = 0;
+  for (int i = 0; i < muestras; i++) {
+    suma += analogReadMilliVolts(pinCorriente);
+    delayMicroseconds(50);
+  }
+  return (suma / muestras) * FACTOR_DIVISOR;
+}
+
+void calibrarOffsetCorriente() {
+  Serial.println("Calibrando sensor de corriente (motor detenido)...");
+  detenerMotor();
+  delay(500);
+  offsetMV = leerMilivoltsSensor(1000);
+  Serial.print("Offset ACS712: ");
+  Serial.print(offsetMV);
+  Serial.println(" mV (deberia estar cerca de 2500)");
+}
+
+// -----------------------------------------------------
+//  Referencia (cero) con el sensor infrarrojo
+// -----------------------------------------------------
+void buscarReferencia() {
+  Serial.println("[INFO] Buscando referencia con el sensor IR...");
+
+  // 1) Si ya está frente a la marca, avanzar hasta salir de ella
+  unsigned long t0 = millis();
+  girarPositivo(PWM_REFERENCIA);
+  while (irDetecta() && (millis() - t0 < TIEMPO_MAX_REF)) delay(2);
+
+  // 2) Avanzar hasta detectar la marca
+  irFlag = false;
+  t0 = millis();
+  while (!irFlag && (millis() - t0 < TIEMPO_MAX_REF)) delay(1);
+
+  frenarMotor();
+  delay(400);
+  detenerMotor();
+
+  if (!irFlag) {
+    Serial.println("[INFO] ERROR: no se detecto la marca. Revisa el sensor IR y su sensibilidad.");
+    noInterrupts();
+    targetPosition = encoderCount;
+    interrupts();
+    return;
+  }
+
+  // El cero queda donde el motor se detuvo: no hay giro de regreso
+  noInterrupts();
+  encoderCount = 0;
+  interrupts();
+
+  targetPosition = 0;
+  anguloObjetivo = 0;
+  lastPosCtrl = 0;
+  velFiltrada = 0;
+  lastCtrlTime = millis();
+
+  Serial.println("[INFO] Referencia encontrada. Cero definido en la posicion actual.");
+}
+
+// -----------------------------------------------------
+//  Comandos por Serial
+// -----------------------------------------------------
+void leerSerial() {
+  if (Serial.available() > 0) {
+    String entrada = Serial.readStringUntil('\n');
+    entrada.trim();
+    entrada.toUpperCase();
+    if (entrada.length() == 0) return;
+
+    // Comando R: buscar la referencia con el sensor IR
+    if (entrada == "R") {
+      buscarReferencia();
+      return;
+    }
+
+    // Comando Z: define la posición actual como 0 grados
+    if (entrada == "Z") {
+      noInterrupts();
+      encoderCount = 0;
+      interrupts();
+      targetPosition = 0;
+      anguloObjetivo = 0;
+      lastPosCtrl = 0;
+      velFiltrada = 0;
+      Serial.println("[INFO] Posicion actual definida como 0 grados");
+      return;
+    }
+
+    float angulo = entrada.toFloat();
+    bool valido = (entrada == "0" || entrada == "0.0" || angulo != 0);
+
+    if (valido && angulo >= 0 && angulo <= 360) {
+      anguloObjetivo = angulo;
+      targetPosition = (long)(angulo * PULSOS_POR_VUELTA / 360.0);
+      Serial.print("[INFO] Nuevo objetivo: ");
+      Serial.print(anguloObjetivo);
+      Serial.print(" grados (");
+      Serial.print(targetPosition);
+      Serial.println(" pulsos)");
+    } else {
+      Serial.println("[INFO] Valor no valido. Escribe un angulo de 0 a 360, R para buscar referencia o Z para poner el cero.");
+    }
+  }
+}
+
+void setup() {
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(pinCorriente, INPUT);
+  pinMode(pinIR, INPUT);
+
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), countEncoder, RISING);
+  attachInterrupt(digitalPinToInterrupt(pinIR), irDetectado, IR_ACTIVO_BAJO ? FALLING : RISING);
+
+  Serial.begin(115200);
+  delay(500);
+
+  calibrarOffsetCorriente();
+
+  lastCtrlTime = millis();
+  Serial.println("Escribe un angulo (0-360) para mover el motor.");
+  Serial.println("R = buscar referencia con sensor IR | Z = fijar cero aqui");
+}
+
+void loop() {
+  leerSerial();
+
+  // Posición actual de forma segura
+  noInterrupts();
+  long currentPosition = encoderCount;
+  interrupts();
+
+  // Velocidad estimada (pulsos/s), con filtro suave para reducir ruido
+  unsigned long ahora = millis();
+  float dt = (ahora - lastCtrlTime) / 1000.0;
+  if (dt > 0.005) {
+    float vRaw = (currentPosition - lastPosCtrl) / dt;
+    velFiltrada = 0.6 * velFiltrada + 0.4 * vRaw;
+    lastPosCtrl = currentPosition;
+    lastCtrlTime = ahora;
+  }
+
+  long error = targetPosition - currentPosition;
+  int pwmValue = 0;
+  bool frenando = false;
+
+  if (abs(error) <= zonaMuerta) {
+    // Llegó: freno eléctrico para que no se pase ni se deslice
+    frenando = true;
+  } else {
+    // Control PD: la fuerza depende de la distancia y se resta según la velocidad
+    float u = Kp * error - Kd * velFiltrada;
+
+    if (fabs(u) < PWM_MIN) {
+      if (fabs(velFiltrada) > 80) {
+        frenando = true;                       // Va rápido y casi sin fuerza: frenar
+      } else {
+        u = (error > 0) ? PWM_MIN : -PWM_MIN;  // Empuje mínimo para terminar de llegar
+      }
+    }
+
+    if (!frenando) {
+      pwmValue = constrain((int)fabs(u), PWM_MIN, PWM_MAX);
+      if (u > 0) girarPositivo(pwmValue);
+      else       girarNegativo(pwmValue);
+    }
+  }
+
+  if (frenando) frenarMotor();
+
+  // Envío de datos cada INTERVALO_TELEMETRIA ms
+  if (ahora - lastTelemetria >= INTERVALO_TELEMETRIA) {
+    lastTelemetria = ahora;
+
+    // Corriente del motor (A)
+    float corriente = (leerMilivoltsSensor(100) - offsetMV) / SENSIBILIDAD_MV_A;
+    float anguloActual = (currentPosition * 360.0) / PULSOS_POR_VUELTA;
+    float errorGrados = (error * 360.0) / PULSOS_POR_VUELTA;
+
+    if (MODO_TELEPLOT) {
+      teleplot("Objetivo", ahora, anguloObjetivo);   // Valor deseado (grados)
+      teleplot("Actual", ahora, anguloActual);       // Valor real (grados)
+      teleplot("Error_deg", ahora, errorGrados);
+      teleplot("PWM", ahora, pwmValue);
+      teleplot("Corriente_A", ahora, corriente);
+    } else {
+      Serial.print("Objetivo: ");
+      Serial.print(anguloObjetivo);
+      Serial.print(" deg | Actual: ");
+      Serial.print(anguloActual);
+      Serial.print(" deg | Error: ");
+      Serial.print(error);
+      Serial.print(" pulsos | PWM: ");
+      Serial.print(pwmValue);
+      Serial.print(" | ");
+      Serial.print(frenando ? "FRENO" : "MOV");
+      Serial.print(" | IR: ");
+      Serial.print(irDetecta() ? 1 : 0);
+      Serial.print(" | Corriente: ");
+      Serial.print(corriente, 3);
+      Serial.println(" A");
+    }
+  }
+
+  delay(5);
+}
