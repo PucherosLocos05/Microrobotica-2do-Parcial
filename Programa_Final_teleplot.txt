@@ -1,0 +1,985 @@
+// =====================================================
+//  CONTROL DE MOTOR: POSICION + VELOCIDAD (RPM) + ACELERACION
+//  ESP32 + L298N + Encoder en cuadratura + ACS712 + Sensor IR
+// =====================================================
+
+// --- Definición de Pines ---
+const int ENA = 25;          // Pin PWM (L298N)
+const int IN1 = 26;          // Dirección 1 (L298N)
+const int IN2 = 27;          // Dirección 2 (L298N)
+const int potPin = 34;       // Potenciómetro
+const int pinCorriente = 35; // Salida del ACS712 (a través del divisor de voltaje)
+const int pinIR = 14;        // Salida (OUT) del sensor infrarrojo
+const int encoderPinA = 32;  // Encoder canal A (con interrupción)
+const int encoderPinB = 33;  // Encoder canal B (dirección)
+
+// --- Configuración del encoder ---
+const long PULSOS_POR_VUELTA = 370;
+
+// --- Configuración de la salida de datos ---
+const bool MODO_TELEPLOT = true;   // true = formato Teleplot, false = texto normal
+
+// --- Configuración del sensor ACS712 ---
+// Sensibilidad según tu modelo: 5A = 185 mV/A, 20A = 100 mV/A, 30A = 66 mV/A
+const float SENSIBILIDAD_MV_A = 185.0;
+const float FACTOR_DIVISOR = 1.5;   // Divisor 10k + 20k
+float offsetMV = 2500;              // Voltaje con 0 A (se calibra al inicio)
+
+// --- Configuración del sensor infrarrojo ---
+const bool IR_ACTIVO_BAJO = true;            // El módulo da LOW cuando detecta la marca
+const int MARCAS_POR_VUELTA = 1;             // Marcas en el eje (tacómetro)
+const unsigned long IR_REBOTE_US = 20000;    // Ignora detecciones a menos de 20 ms
+const unsigned long IR_TIMEOUT_US = 3000000; // Tiempo mínimo para considerar detenido
+const int PWM_REFERENCIA = 75;               // Velocidad lenta para buscar la referencia
+const unsigned long TIEMPO_MAX_REF = 10000;  // Máximo 10 s buscando la marca
+
+// --- Calibraciones: si son mayores a 0, se usan y se omite la calibración ---
+// Después de calibrar, anota aquí los números que imprime.
+const float VEL_MAX_PPS_MANUAL = 0;   // Velocidad máxima en pulsos/s a PWM 255
+const int ARRANQUE_MANUAL = 0;        // PWM al que el motor empieza a girar
+
+// --- Parámetros del modo POSICION (control PD) ---
+float KpPos = 3.0;          // Fuerza según la distancia al objetivo
+float KdPos = 0.20;         // Amortiguación según la velocidad (sube si aún se pasa)
+const int PWM_MIN_POS = 70; // PWM mínimo para vencer la fricción
+const int PWM_MAX = 255;
+const int zonaMuerta = 2;   // Margen de +/- pulsos para considerar "llegó"
+const unsigned long INTERVALO_TELEMETRIA = 30;
+
+// --- Parámetros del modo VELOCIDAD (control PI en RPM) ---
+const float LIMITE_RPM = 0.95;       // Solo se permite pedir hasta el 95% de las RPM máximas
+float KpVel = 1.5;                   // PWM por cada 1% de error
+float KiVel = 4.0;                   // PWM por cada 1% de error acumulado en 1 s
+const float AJUSTE_MAX_I_VEL = 80.0; // Máximo aporte del integral (en PWM)
+const unsigned long CONTROL_VEL_MS = 50;
+
+// --- Parámetros del modo ACELERACION (perfiles con control PI) ---
+const float REF_ESCALA = 0.90;       // El 100% del perfil equivale al 90% de la velocidad máxima
+const float ADELANTO_S = 0.15;       // Adelanto para compensar el retraso del motor
+float KpAc = 2.5;
+float KiAc = 4.0;
+const float AJUSTE_MAX_I_AC = 80.0;
+const float K_FRENO = 1.0;           // Fuerza del freno activo
+const unsigned long CONTROL_ACEL_MS = 20;
+const unsigned long IMPRESION_ACEL_MS = 40;
+
+// --- Modos de operación ---
+const int MODO_STOP     = 0;
+const int MODO_POSICION = 1;
+const int MODO_VEL      = 2;   // RPM recibidas por Serial
+const int MODO_VEL_POT  = 3;   // RPM con el potenciómetro
+const int MODO_ACEL     = 4;
+int modo = MODO_STOP;
+
+// --- Medición de velocidad por tiempo entre pulsos ---
+const int N_MUESTRAS = 12;
+volatile unsigned long tPulso[N_MUESTRAS];
+volatile int idxPulso = 0;
+volatile int nPulsos = 0;
+volatile long encoderCount = 0;
+
+// --- Tacómetro / referencia infrarroja ---
+volatile unsigned long irUltimoUs = 0;
+volatile unsigned long irPeriodoUs = 0;
+volatile long irVueltas = 0;
+volatile bool irFlag = false;      // Primera detección (para la referencia)
+volatile long irCount = 0;         // Posición del encoder en esa detección
+
+// --- Datos del motor (compartidos por velocidad y aceleración) ---
+bool calibradoVel = false;
+float velMaxPPS = 1000;            // Velocidad máxima en pulsos/s
+float rpmMax = 100;                // Velocidad máxima en RPM
+int pwmArranque = 60;              // PWM al que el motor empieza a girar
+int pwmMin = 50;                   // PWM mínimo para mantener el giro
+float integral = 0;                // Acumulador del control integral
+unsigned long paradoDesde = 0;     // Desde cuándo está detenido (0 = en movimiento)
+unsigned long kickHasta = 0;       // Hasta cuándo dura el empujón de arranque
+
+// --- Variables de POSICION ---
+long targetPosition = 0;
+float anguloObjetivo = 0;
+float velFiltrada = 0;             // Velocidad con signo (pulsos/s)
+long lastPosCtrl = 0;
+unsigned long lastCtrlTime = 0;
+unsigned long lastTelemetria = 0;
+
+// --- Variables de VELOCIDAD ---
+float rpmDeseadaManual = 0;
+float rpmReal = 0;
+unsigned long lastTickVel = 0;
+
+// --- Variables de ACELERACION ---
+int tipoPerfil = 2;
+unsigned long tInicio = 0;
+unsigned long lastTickAcel = 0;
+unsigned long lastPrintAcel = 0;
+float velFilt = 0;
+float epsilonRuido = 0;
+unsigned long lastNoise = 0;
+
+// -----------------------------------------------------
+//  Interrupciones
+// -----------------------------------------------------
+void IRAM_ATTR countEncoder() {
+  if (digitalRead(encoderPinB) == HIGH) {
+    encoderCount++;
+  } else {
+    encoderCount--;
+  }
+  tPulso[idxPulso] = micros();
+  idxPulso = (idxPulso + 1) % N_MUESTRAS;
+  if (nPulsos < N_MUESTRAS) nPulsos++;
+}
+
+// Se ejecuta cada vez que el IR detecta la marca
+void IRAM_ATTR irDetectado() {
+  unsigned long t = micros();
+  unsigned long dt = t - irUltimoUs;
+  if (irUltimoUs == 0 || dt > IR_REBOTE_US) {
+    if (irUltimoUs != 0) irPeriodoUs = dt;
+    irUltimoUs = t;
+    irVueltas++;
+    if (!irFlag) {              // Solo la primera detección para la referencia
+      irCount = encoderCount;
+      irFlag = true;
+    }
+  }
+}
+
+bool irDetecta() {
+  return digitalRead(pinIR) == (IR_ACTIVO_BAJO ? LOW : HIGH);
+}
+
+// -----------------------------------------------------
+//  Mediciones
+// -----------------------------------------------------
+// Velocidad en pulsos/s (valor absoluto) usando los últimos k pulsos. 0 si está detenido.
+float leerVelocidadPPS(int k, unsigned long timeoutUs) {
+  noInterrupts();
+  int n = nPulsos;
+  int idx = idxPulso;
+  if (n > k) n = k;
+  unsigned long tNuevo = tPulso[(idx - 1 + N_MUESTRAS) % N_MUESTRAS];
+  unsigned long tViejo = tPulso[(idx - n + N_MUESTRAS) % N_MUESTRAS];
+  interrupts();
+
+  if (n < 2) return 0;
+
+  if (micros() - tNuevo > timeoutUs) {
+    noInterrupts();
+    nPulsos = 0;               // Descartar muestras viejas para el próximo arranque
+    interrupts();
+    return 0;
+  }
+
+  unsigned long dtUs = tNuevo - tViejo;
+  if (dtUs == 0) return 0;
+  return ((n - 1) * 1000000.0) / (float)dtUs;
+}
+
+// RPM medidas con el sensor infrarrojo (0 si no hay marcas recientes)
+float leerRPM_IR() {
+  noInterrupts();
+  unsigned long periodo = irPeriodoUs;
+  unsigned long ultimo = irUltimoUs;
+  interrupts();
+
+  if (periodo == 0) return 0;
+  unsigned long limite = (unsigned long)(periodo * 2.5);
+  if (limite < IR_TIMEOUT_US) limite = IR_TIMEOUT_US;
+  if (micros() - ultimo > limite) return 0;
+  return 60000000.0 / ((float)periodo * MARCAS_POR_VUELTA);
+}
+
+// Envía una variable en formato Teleplot:  >nombre:tiempo:valor
+void teleplot(const char* nombre, unsigned long ts, float valor) {
+  Serial.print('>');
+  Serial.print(nombre);
+  Serial.print(':');
+  Serial.print(ts);
+  Serial.print(':');
+  Serial.println(valor, 2);
+}
+
+// -----------------------------------------------------
+//  Motor
+// -----------------------------------------------------
+void detenerMotor() {            // Libre (sin freno)
+  analogWrite(ENA, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+}
+
+void direccionAdelante() {       // Sentido de los modos de velocidad y aceleración
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+}
+
+void frenarMotor(int fuerza) {   // Freno eléctrico proporcional
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, fuerza);
+}
+
+void girarPositivo(int pwm) {    // Sentido en el que aumentan los pulsos (posición)
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, pwm);
+}
+
+void girarNegativo(int pwm) {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, pwm);
+}
+
+// Cambio de modo seguro: frena y reinicia mediciones y controladores
+void cambiarModo(int nuevo) {
+  detenerMotor();
+  modo = nuevo;
+
+  integral = 0;
+  paradoDesde = 0;
+  kickHasta = 0;
+  velFilt = 0;
+  rpmReal = 0;
+  velFiltrada = 0;
+
+  noInterrupts();
+  nPulsos = 0;
+  lastPosCtrl = encoderCount;
+  interrupts();
+
+  unsigned long ahora = millis();
+  lastCtrlTime = ahora;
+  lastTelemetria = ahora;
+  lastTickVel = ahora;
+  lastTickAcel = ahora;
+  lastPrintAcel = ahora;
+  tInicio = ahora;
+}
+
+// -----------------------------------------------------
+//  Sensor de corriente ACS712
+// -----------------------------------------------------
+float leerMilivoltsSensor(int muestras) {
+  float suma = 0;
+  for (int i = 0; i < muestras; i++) {
+    suma += analogReadMilliVolts(pinCorriente);
+    delayMicroseconds(50);
+  }
+  return (suma / muestras) * FACTOR_DIVISOR;
+}
+
+float leerCorriente(int muestras) {
+  return (leerMilivoltsSensor(muestras) - offsetMV) / SENSIBILIDAD_MV_A;
+}
+
+void calibrarOffsetCorriente() {
+  Serial.println("Calibrando sensor de corriente (motor detenido)...");
+  detenerMotor();
+  delay(500);
+  offsetMV = leerMilivoltsSensor(1000);
+  Serial.print("Offset ACS712: ");
+  Serial.print(offsetMV);
+  Serial.println(" mV (deberia estar cerca de 2500)");
+}
+
+// -----------------------------------------------------
+//  Calibraciones del motor (velocidad y aceleración)
+// -----------------------------------------------------
+// Sube el PWM poco a poco hasta que el motor empieza a girar
+void calibrarArranque() {
+  Serial.println("Buscando PWM de arranque (el motor girara lentamente)...");
+  direccionAdelante();
+  int encontrado = 0;
+
+  for (int pwm = 20; pwm <= 200; pwm += 2) {
+    noInterrupts();
+    long antes = encoderCount;
+    interrupts();
+    analogWrite(ENA, pwm);
+    delay(120);
+    noInterrupts();
+    long despues = encoderCount;
+    interrupts();
+    if (abs(despues - antes) >= 4) {
+      encontrado = pwm;
+      break;
+    }
+  }
+
+  detenerMotor();
+  delay(800);
+
+  if (encontrado == 0) {
+    Serial.println("ERROR: el motor no arranco. Usando valores provisionales (arranque 60, minimo 50).");
+    pwmArranque = 60;
+    pwmMin = 50;
+  } else {
+    pwmArranque = encontrado;
+    pwmMin = (int)(encontrado * 0.8);
+    Serial.print("PWM de arranque: ");
+    Serial.print(pwmArranque);
+    Serial.print(" | PWM minimo: ");
+    Serial.println(pwmMin);
+  }
+}
+
+// Motor a PWM 255 para medir la velocidad máxima
+void calibrarVelocidadMaxima() {
+  Serial.println("Calibrando velocidad maxima (el motor girara a tope)...");
+  direccionAdelante();
+  analogWrite(ENA, 255);
+  delay(2000);                         // Esperar a que el motor se estabilice
+
+  noInterrupts();
+  long inicio = encoderCount;
+  interrupts();
+  unsigned long t0 = millis();
+  delay(1000);                         // Medir durante 1 segundo
+  noInterrupts();
+  long fin = encoderCount;
+  interrupts();
+
+  float medida = abs(fin - inicio) * 1000.0 / (millis() - t0);
+
+  detenerMotor();
+  delay(1000);                         // Dejar que el motor se detenga
+
+  if (medida < 10) {
+    Serial.println("ERROR: calibracion fallida (casi 0 pulsos). Revisa alimentacion del motor y el encoder.");
+    Serial.println("Usando valor provisional de 1000 pulsos/s.");
+    velMaxPPS = 1000;
+  } else {
+    velMaxPPS = medida;
+    Serial.print("Velocidad maxima: ");
+    Serial.print(velMaxPPS);
+    Serial.println(" pulsos/s");
+  }
+}
+
+// Se ejecuta solo la primera vez que se usa velocidad o aceleración
+void asegurarCalibracionVelocidad() {
+  if (calibradoVel) return;
+
+  if (ARRANQUE_MANUAL > 0) {
+    pwmArranque = ARRANQUE_MANUAL;
+    pwmMin = (int)(ARRANQUE_MANUAL * 0.8);
+    Serial.print("Usando PWM de arranque manual: ");
+    Serial.println(pwmArranque);
+  } else {
+    calibrarArranque();
+  }
+
+  if (VEL_MAX_PPS_MANUAL > 0) {
+    velMaxPPS = VEL_MAX_PPS_MANUAL;
+    Serial.print("Usando velocidad maxima manual: ");
+    Serial.print(velMaxPPS);
+    Serial.println(" pulsos/s");
+  } else {
+    calibrarVelocidadMaxima();
+  }
+
+  rpmMax = velMaxPPS * 60.0 / PULSOS_POR_VUELTA;
+  Serial.print("RPM maximas equivalentes: ");
+  Serial.println(rpmMax);
+  calibradoVel = true;
+}
+
+// -----------------------------------------------------
+//  Referencia (cero) con el sensor infrarrojo
+// -----------------------------------------------------
+void buscarReferencia() {
+  Serial.println("[INFO] Buscando referencia con el sensor IR...");
+
+  // 1) Si ya está frente a la marca, avanzar hasta salir de ella
+  unsigned long t0 = millis();
+  girarPositivo(PWM_REFERENCIA);
+  while (irDetecta() && (millis() - t0 < TIEMPO_MAX_REF)) delay(2);
+
+  // 2) Avanzar hasta detectar la marca
+  irFlag = false;
+  t0 = millis();
+  while (!irFlag && (millis() - t0 < TIEMPO_MAX_REF)) delay(1);
+
+  frenarMotor(255);
+  delay(400);
+  detenerMotor();
+
+  if (!irFlag) {
+    Serial.println("[INFO] ERROR: no se detecto la marca. Revisa el sensor IR y su sensibilidad.");
+    noInterrupts();
+    targetPosition = encoderCount;
+    interrupts();
+    return;
+  }
+
+  // El cero queda donde el motor se detuvo
+  noInterrupts();
+  encoderCount = 0;
+  interrupts();
+
+  targetPosition = 0;
+  anguloObjetivo = 0;
+  lastPosCtrl = 0;
+  velFiltrada = 0;
+  lastCtrlTime = millis();
+
+  Serial.println("[INFO] Referencia encontrada. Cero definido en la posicion actual.");
+}
+
+// -----------------------------------------------------
+//  Perfiles de aceleración (devuelven un valor equivalente a 0-255)
+// -----------------------------------------------------
+float perfilPWM(int tipo, float t) {
+  float p = 0;
+
+  switch (tipo) {
+
+    // 1. Constante
+    case 1:
+      p = 120;
+      break;
+
+    // 2. Rampa lineal
+    case 2:
+      p = 20 * fmod(t, 15.0);
+      break;
+
+    // 3. Trapezoidal
+    case 3: {
+      float ciclo = fmod(t, 12.0);
+      if (ciclo < 3.0) p = ciclo * 80;
+      else if (ciclo < 9.0) p = 240;
+      else p = 240 - ((ciclo - 9.0) * 80);
+      break;
+    }
+
+    // 4. Senoidal
+    case 4:
+      p = 125 + 100 * sin(2 * 3.14159 * 0.2 * t);
+      break;
+
+    // 5. Escalonada (onda cuadrada)
+    case 5:
+      p = (fmod(t, 6.0) < 3.0) ? 60 : 220;
+      break;
+
+    // 6. Exponencial creciente
+    case 6: {
+      float t_mod = fmod(t, 10.0);
+      p = 20 * pow((1.0 + 0.5 * t_mod), 1.2);
+      break;
+    }
+
+    // 7. Gaussiano
+    case 7: {
+      float t_mod = fmod(t, 10.0);
+      p = 250 * exp(-pow((t_mod - 5.0) / 1.5, 2));
+      break;
+    }
+
+    // 8. Diente de sierra
+    case 8:
+      p = 255 * fmod(t / 5.0, 1.0);
+      break;
+
+    // 9. Ruido blanco (el ruido se renueva cada 100 ms)
+    case 9:
+      p = 128 + epsilonRuido;
+      break;
+  }
+
+  return constrain(p, 0, 255);
+}
+
+// -----------------------------------------------------
+//  Comandos por Serial
+// -----------------------------------------------------
+void mostrarAyuda() {
+  Serial.println("=========== COMANDOS ===========");
+  Serial.println("P<grados>  Posicion 0-360.            Ej: P90");
+  Serial.println("V<rpm>     Velocidad en RPM.          Ej: V60");
+  Serial.println("POT        Velocidad con potenciometro");
+  Serial.println("A<perfil>  Curva de aceleracion 1-9.  Ej: A4");
+  Serial.println("REF        Buscar referencia (cero) con el sensor IR");
+  Serial.println("Z          Fijar cero (0 grados) en la posicion actual");
+  Serial.println("S          Detener motor");
+  Serial.println("H          Mostrar esta ayuda");
+  Serial.println("================================");
+}
+
+// Verifica que el texto sea un número (dígitos y un punto decimal)
+bool esNumeroValido(const String& s) {
+  if (s.length() == 0 || s == ".") return false;
+  int puntos = 0;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    if (s[i] == '.') {
+      puntos++;
+      if (puntos > 1) return false;
+    } else if (!isDigit(s[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void procesarComando(String entrada) {
+  entrada.trim();
+  entrada.toUpperCase();
+  if (entrada.length() == 0) return;
+
+  // Detener
+  if (entrada == "S") {
+    cambiarModo(MODO_STOP);
+    Serial.println("[INFO] Motor DETENIDO");
+    return;
+  }
+
+  // Ayuda
+  if (entrada == "H" || entrada == "?") {
+    mostrarAyuda();
+    return;
+  }
+
+  // Fijar cero
+  if (entrada == "Z") {
+    noInterrupts();
+    encoderCount = 0;
+    interrupts();
+    targetPosition = 0;
+    anguloObjetivo = 0;
+    lastPosCtrl = 0;
+    velFiltrada = 0;
+    Serial.println("[INFO] Posicion actual definida como 0 grados");
+    return;
+  }
+
+  // Buscar referencia con el sensor IR
+  if (entrada == "REF") {
+    cambiarModo(MODO_POSICION);
+    buscarReferencia();
+    return;
+  }
+
+  // Velocidad con potenciómetro
+  if (entrada == "POT") {
+    asegurarCalibracionVelocidad();
+    cambiarModo(MODO_VEL_POT);
+    Serial.println("[INFO] Modo VELOCIDAD con POTENCIOMETRO activado");
+    return;
+  }
+
+  char c = entrada[0];
+  String arg = entrada.substring(1);
+  arg.trim();
+
+  // ----- POSICION: P<grados> -----
+  if (c == 'P') {
+    if (esNumeroValido(arg)) {
+      float angulo = arg.toFloat();
+      if (angulo >= 0 && angulo <= 360) {
+        if (modo != MODO_POSICION) cambiarModo(MODO_POSICION);
+        anguloObjetivo = angulo;
+        targetPosition = (long)(angulo * PULSOS_POR_VUELTA / 360.0);
+        Serial.print("[INFO] Modo POSICION. Nuevo objetivo: ");
+        Serial.print(anguloObjetivo);
+        Serial.print(" grados (");
+        Serial.print(targetPosition);
+        Serial.println(" pulsos)");
+        return;
+      }
+    }
+    Serial.println("[INFO] Valor no valido. Escribe P seguido de un angulo de 0 a 360. Ej: P90");
+    return;
+  }
+
+  // ----- VELOCIDAD: V<rpm> -----
+  if (c == 'V') {
+    if (esNumeroValido(arg)) {
+      asegurarCalibracionVelocidad();
+      float rpm = arg.toFloat();
+      float limite = rpmMax * LIMITE_RPM;
+      if (rpm > limite) {
+        rpm = limite;
+        Serial.print("[INFO] RPM limitadas al maximo permitido: ");
+      } else {
+        Serial.print("[INFO] Modo VELOCIDAD. RPM deseadas = ");
+      }
+      Serial.println(rpm);
+      if (modo != MODO_VEL) cambiarModo(MODO_VEL);
+      rpmDeseadaManual = rpm;
+      integral = 0;
+      return;
+    }
+    Serial.println("[INFO] Valor no valido. Escribe V seguido de las RPM. Ej: V60");
+    return;
+  }
+
+  // ----- ACELERACION: A<perfil> -----
+  if (c == 'A') {
+    if (esNumeroValido(arg) && arg.indexOf('.') < 0) {
+      int n = arg.toInt();
+      if (n >= 1 && n <= 9) {
+        asegurarCalibracionVelocidad();
+        tipoPerfil = n;
+        cambiarModo(MODO_ACEL);   // Reinicia el tiempo del perfil
+        Serial.print("[INFO] Modo ACELERACION. Perfil ");
+        Serial.println(tipoPerfil);
+        return;
+      }
+    }
+    Serial.println("[INFO] Valor no valido. Escribe A seguido de un perfil 1-9. Ej: A4");
+    return;
+  }
+
+  Serial.println("[INFO] Comando no valido. Escribe H para ver la ayuda.");
+}
+
+void leerSerial() {
+  if (Serial.available() > 0) {
+    String entrada = Serial.readStringUntil('\n');
+    procesarComando(entrada);
+  }
+}
+
+// -----------------------------------------------------
+//  MODO POSICION
+// -----------------------------------------------------
+void loopPosicion() {
+  // Posición actual de forma segura
+  noInterrupts();
+  long currentPosition = encoderCount;
+  interrupts();
+
+  // Velocidad estimada (pulsos/s), con filtro suave para reducir ruido
+  unsigned long ahora = millis();
+  float dt = (ahora - lastCtrlTime) / 1000.0;
+  if (dt > 0.005) {
+    float vRaw = (currentPosition - lastPosCtrl) / dt;
+    velFiltrada = 0.6 * velFiltrada + 0.4 * vRaw;
+    lastPosCtrl = currentPosition;
+    lastCtrlTime = ahora;
+  }
+
+  long error = targetPosition - currentPosition;
+  int pwmValue = 0;
+  bool frenando = false;
+
+  if (abs(error) <= zonaMuerta) {
+    // Llegó: freno eléctrico para que no se pase ni se deslice
+    frenando = true;
+  } else {
+    // Control PD: la fuerza depende de la distancia y se resta según la velocidad
+    float u = KpPos * error - KdPos * velFiltrada;
+
+    if (fabs(u) < PWM_MIN_POS) {
+      if (fabs(velFiltrada) > 80) {
+        frenando = true;                           // Va rápido y casi sin fuerza: frenar
+      } else {
+        u = (error > 0) ? PWM_MIN_POS : -PWM_MIN_POS;  // Empuje mínimo para terminar de llegar
+      }
+    }
+
+    if (!frenando) {
+      pwmValue = constrain((int)fabs(u), PWM_MIN_POS, PWM_MAX);
+      if (u > 0) girarPositivo(pwmValue);
+      else       girarNegativo(pwmValue);
+    }
+  }
+
+  if (frenando) frenarMotor(255);
+
+  // Envío de datos
+  if (ahora - lastTelemetria >= INTERVALO_TELEMETRIA) {
+    lastTelemetria = ahora;
+
+    float corriente = leerCorriente(100);
+    float anguloActual = (currentPosition * 360.0) / PULSOS_POR_VUELTA;
+    float errorGrados = (error * 360.0) / PULSOS_POR_VUELTA;
+
+    if (MODO_TELEPLOT) {
+      teleplot("Objetivo", ahora, anguloObjetivo);   // Valor deseado (grados)
+      teleplot("Actual", ahora, anguloActual);       // Valor real (grados)
+      teleplot("Error_deg", ahora, errorGrados);
+      teleplot("PWM", ahora, pwmValue);
+      teleplot("Corriente_A", ahora, corriente);
+    } else {
+      Serial.print("Objetivo: ");
+      Serial.print(anguloObjetivo);
+      Serial.print(" deg | Actual: ");
+      Serial.print(anguloActual);
+      Serial.print(" deg | Error: ");
+      Serial.print(error);
+      Serial.print(" pulsos | PWM: ");
+      Serial.print(pwmValue);
+      Serial.print(" | ");
+      Serial.print(frenando ? "FRENO" : "MOV");
+      Serial.print(" | IR: ");
+      Serial.print(irDetecta() ? 1 : 0);
+      Serial.print(" | Corriente: ");
+      Serial.print(corriente, 3);
+      Serial.println(" A");
+    }
+  }
+
+  delay(5);
+}
+
+// -----------------------------------------------------
+//  MODO VELOCIDAD (RPM por Serial o con potenciómetro)
+// -----------------------------------------------------
+void loopVelocidad() {
+  unsigned long ahora = millis();
+  if (ahora - lastTickVel < CONTROL_VEL_MS) {
+    delay(1);
+    return;
+  }
+  float dt = (ahora - lastTickVel) / 1000.0;
+  lastTickVel = ahora;
+
+  // 1. RPM reales con el encoder (por tiempo entre pulsos)
+  float ppsInst = leerVelocidadPPS(12, 250000UL);
+  float rpmInstantanea = ppsInst * 60.0 / PULSOS_POR_VUELTA;
+  bool detenido = (ppsInst == 0);
+  if (detenido) rpmReal = 0;
+  else          rpmReal = 0.5 * rpmInstantanea + 0.5 * rpmReal;
+
+  // 2. RPM deseadas: del potenciómetro o del valor recibido por Serial
+  int potValue = analogRead(potPin);
+  float rpmDeseada;
+  if (modo == MODO_VEL) {
+    rpmDeseada = rpmDeseadaManual;
+  } else {
+    rpmDeseada = (potValue / 4095.0) * rpmMax * LIMITE_RPM;
+    if (rpmDeseada < rpmMax * 0.02) rpmDeseada = 0;   // Zona muerta del potenciómetro
+  }
+
+  // 3. Control
+  int pwmValue = 0;
+  if (rpmDeseada < 0.5) {
+    integral = 0;          // Pedir 0 RPM = motor apagado
+    paradoDesde = 0;
+  } else {
+    if (!detenido) paradoDesde = 0;
+    else if (paradoDesde == 0) paradoDesde = ahora;
+
+    if (ahora < kickHasta) {
+      // Empujón en curso para vencer la fricción estática
+      pwmValue = constrain(pwmArranque + 15, 0, 255);
+    } else if (detenido && paradoDesde != 0 && (ahora - paradoDesde) > 150) {
+      // Lleva detenido más de 150 ms: dar un empujón corto
+      kickHasta = ahora + 80;
+      paradoDesde = 0;
+      pwmValue = constrain(pwmArranque + 15, 0, 255);
+    } else {
+      // Control normal: estimación inicial + PI
+      float errorPct = ((rpmDeseada - rpmReal) / rpmMax) * 100.0;
+      float base = pwmMin + (255.0 - pwmMin) * (rpmDeseada / rpmMax);
+
+      if (!detenido) {      // El integral solo se acumula si el motor gira
+        integral += errorPct * dt;
+        float limiteI = AJUSTE_MAX_I_VEL / KiVel;
+        integral = constrain(integral, -limiteI, limiteI);
+      }
+
+      float u = base + KpVel * errorPct + KiVel * integral;
+      pwmValue = constrain((int)u, 0, 255);
+    }
+  }
+
+  direccionAdelante();
+  analogWrite(ENA, pwmValue);
+
+  // 4. Sensor infrarrojo y corriente
+  float rpmIR = leerRPM_IR();
+  noInterrupts();
+  long pulsos = encoderCount;
+  long vueltasIR = irVueltas;
+  interrupts();
+  float corriente = leerCorriente(100);
+
+  // 5. Impresión
+  if (MODO_TELEPLOT) {
+    teleplot("RPM_Deseada", ahora, rpmDeseada);
+    teleplot("RPM_Real", ahora, rpmReal);
+    teleplot("RPM_IR", ahora, rpmIR);
+    teleplot("PWM", ahora, pwmValue);
+    teleplot("Corriente_A", ahora, corriente);
+  } else {
+    Serial.print("Modo: ");
+    Serial.print(modo == MODO_VEL ? "MANUAL" : "POT");
+    Serial.print(" | RPM deseada: ");
+    Serial.print(rpmDeseada, 1);
+    Serial.print(" | RPM real: ");
+    Serial.print(rpmReal, 1);
+    Serial.print(" | RPM IR: ");
+    Serial.print(rpmIR, 1);
+    Serial.print(" | PWM: ");
+    Serial.print(pwmValue);
+    Serial.print(" | Pulsos: ");
+    Serial.print(pulsos);
+    Serial.print(" | Vueltas IR: ");
+    Serial.print(vueltasIR);
+    Serial.print(" | Corriente: ");
+    Serial.print(corriente, 3);
+    Serial.println(" A");
+  }
+}
+
+// -----------------------------------------------------
+//  MODO ACELERACION (perfiles 1 al 9 con control PI)
+// -----------------------------------------------------
+void loopAceleracion() {
+  unsigned long ahora = millis();
+  if (ahora - lastTickAcel < CONTROL_ACEL_MS) {
+    delay(1);
+    return;
+  }
+  float dt = (ahora - lastTickAcel) / 1000.0;
+  lastTickAcel = ahora;
+
+  // Tiempo en segundos desde que arrancó el perfil
+  float t = (ahora - tInicio) / 1000.0;
+
+  // Ruido del perfil 9
+  if (tipoPerfil == 9 && ahora - lastNoise >= 100) {
+    lastNoise = ahora;
+    epsilonRuido = random(-50, 50);
+  }
+
+  // 1. Velocidad deseada ahora, y la que se desea un instante después (adelanto)
+  float velMeta     = (perfilPWM(tipoPerfil, t) / 255.0) * velMaxPPS * REF_ESCALA;
+  float velMetaAdel = (perfilPWM(tipoPerfil, t + ADELANTO_S) / 255.0) * velMaxPPS * REF_ESCALA;
+
+  // 2. Velocidad real medida con el encoder
+  float vInst = leerVelocidadPPS(6, 200000UL);
+  bool detenido = (vInst == 0);
+  if (detenido) velFilt = 0;
+  else          velFilt = 0.6 * vInst + 0.4 * velFilt;
+
+  // 3. Control: estimación inicial + PI
+  float errorPct = ((velMeta - velFilt) / velMaxPPS) * 100.0;
+  bool metaActiva = (velMeta > 0.01 * velMaxPPS);
+
+  float base = 0;
+  if (velMetaAdel > 0.01 * velMaxPPS) {
+    base = pwmMin + (255.0 - pwmMin) * (velMetaAdel / velMaxPPS);
+  }
+
+  if (!metaActiva) {
+    integral = 0;
+    paradoDesde = 0;
+  } else if (!detenido) {
+    integral += errorPct * dt;
+    float limiteI = AJUSTE_MAX_I_AC / KiAc;
+    integral = constrain(integral, -limiteI, limiteI);
+    paradoDesde = 0;
+  } else if (paradoDesde == 0) {
+    paradoDesde = ahora;
+  }
+
+  float u = base + KpAc * errorPct + KiAc * integral;
+
+  // 4. Aplicar al motor
+  int pwmValue = 0;
+  bool frenando = false;
+
+  if (ahora < kickHasta) {
+    // Empujón en curso para vencer la fricción estática
+    pwmValue = constrain(pwmArranque + 15, 0, 255);
+    direccionAdelante();
+    analogWrite(ENA, pwmValue);
+  } else if (metaActiva && detenido && paradoDesde != 0 && (ahora - paradoDesde) > 100) {
+    // Lleva detenido más de 100 ms pidiendo velocidad: empujón corto
+    kickHasta = ahora + 60;
+    paradoDesde = 0;
+    pwmValue = constrain(pwmArranque + 15, 0, 255);
+    direccionAdelante();
+    analogWrite(ENA, pwmValue);
+  } else if (u >= 0) {
+    pwmValue = constrain((int)u, 0, 255);
+    direccionAdelante();
+    analogWrite(ENA, pwmValue);
+  } else if (!detenido) {
+    // Va más rápido de lo deseado: frenar activamente
+    frenando = true;
+    pwmValue = constrain((int)(-u * K_FRENO), 0, 255);
+    frenarMotor(pwmValue);
+  } else {
+    detenerMotor();
+  }
+
+  // 5. Impresión
+  if (ahora - lastPrintAcel >= IMPRESION_ACEL_MS) {
+    lastPrintAcel = ahora;
+
+    float corriente = leerCorriente(60);
+    float ideal = (velMeta / velMaxPPS) * 100.0;   // Velocidad deseada (% de la máxima)
+    float real  = (velFilt / velMaxPPS) * 100.0;   // Velocidad real (% de la máxima)
+
+    if (MODO_TELEPLOT) {
+      teleplot("Ideal", ahora, ideal);
+      teleplot("Real", ahora, real);
+      teleplot("Error_pct", ahora, ideal - real);
+      teleplot("PWM", ahora, frenando ? -pwmValue : pwmValue);   // Negativo = frenando
+      teleplot("Corriente_A", ahora, corriente);
+    } else {
+      Serial.print("Min:0,Max:100,");   // Líneas fijas que obligan a la escala 0-100
+      Serial.print("Ideal:");
+      Serial.print(ideal);
+      Serial.print(",Real:");
+      Serial.print(real);
+      Serial.print(",Corriente_A:");
+      Serial.println(corriente, 3);
+    }
+  }
+}
+
+// -----------------------------------------------------
+//  SETUP y LOOP
+// -----------------------------------------------------
+void setup() {
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(potPin, INPUT);
+  pinMode(pinCorriente, INPUT);
+  pinMode(pinIR, INPUT);
+
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), countEncoder, RISING);
+  attachInterrupt(digitalPinToInterrupt(pinIR), irDetectado, IR_ACTIVO_BAJO ? FALLING : RISING);
+
+  Serial.begin(115200);
+  Serial.setTimeout(20);
+  delay(500);
+
+  detenerMotor();
+  calibrarOffsetCorriente();   // Con el motor apagado
+
+  mostrarAyuda();
+  Serial.println("Motor detenido. Escribe un comando para empezar.");
+}
+
+void loop() {
+  leerSerial();
+
+  switch (modo) {
+    case MODO_POSICION:
+      loopPosicion();
+      break;
+    case MODO_VEL:
+    case MODO_VEL_POT:
+      loopVelocidad();
+      break;
+    case MODO_ACEL:
+      loopAceleracion();
+      break;
+    default:
+      delay(2);   // MODO_STOP: motor detenido
+      break;
+  }
+}
